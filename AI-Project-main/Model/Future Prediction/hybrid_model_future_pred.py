@@ -103,35 +103,46 @@ def preprocess_data(player_df, playoff_df, fit_scalers=False, player_scaler=None
     # Aggregate team stats with proper group handling
     team_agg_list = []
     for (team, season), group in player_df.groupby(['Team', 'Season']):
+        # Base stats
+        mp_sum = group['MP'].sum()
+        pts_sum = group['PTS'].sum()
+        ast_sum = group['AST'].sum()
+        tov_sum = group['TOV'].sum()
+        trb_sum = group['TRB'].sum()
+        g_mean = group['G'].mean()
+        
         agg_dict = {
             'Team': team,
             'Season': season,
-            'MP_sum': group['MP'].sum(),
-            'FG%_wt': weighted_avg(group, 'FG%'),
-            '3P%_wt': weighted_avg(group, '3P%'),
-            'eFG%_wt': weighted_avg(group, 'eFG%'),
+            # Removed: MP_sum, FG%_wt, 3P%_wt, eFG%_wt, BLK_sum, PF_sum (negative importance)
             'FT%_wt': weighted_avg(group, 'FT%'),
-            'TRB_sum': group['TRB'].sum(),
-            'AST_sum': group['AST'].sum(),
+            'TRB_sum': trb_sum,
+            'AST_sum': ast_sum,
             'AST_top3': group['AST'].nlargest(3).mean() if len(group) >= 3 else 0,
             'STL_sum': group['STL'].sum(),
-            'BLK_sum': group['BLK'].sum(),
-            'TOV_sum': group['TOV'].sum(),
-            'PF_sum': group['PF'].sum(),
-            'PTS_sum': group['PTS'].sum(),
+            'TOV_sum': tov_sum,
+            'PTS_sum': pts_sum,
             'PTS_top3': group['PTS'].nlargest(3).mean() if len(group) >= 3 else 0,
-            'G_mean': group['G'].mean(),
-            'G_std': group['G'].std()
+            'G_mean': g_mean,
+            'G_std': group['G'].std(),
+            # Derived efficiency features
+            'PTS_per_game': pts_sum / max(g_mean, 1),  # Points per game average
+            'AST_TOV_ratio': ast_sum / max(tov_sum, 1),  # Assist-to-turnover ratio
+            'TRB_per_min': trb_sum / max(mp_sum, 1),  # Rebounds per minute
+            'MP_per_game': mp_sum / max(g_mean, 1)  # Minutes per game (normalized)
         }
         team_agg_list.append(agg_dict)
     
     team_agg = pd.DataFrame(team_agg_list)
     
-    # flatten multi-index columns
+    # Handle infinite values from division
+    team_agg = team_agg.replace([np.inf, -np.inf], 0)
+    
+    # flatten multi-index columns (now 16 features instead of 18)
     team_agg.columns = [
-        'Team', 'Season', 'MP_sum', 'FG%_wt', '3P%_wt', 'eFG%_wt', 'FT%_wt',
-        'TRB_sum', 'AST_sum', 'AST_top3', 'STL_sum', 'BLK_sum', 'TOV_sum',
-        'PF_sum', 'PTS_sum', 'PTS_top3', 'G_mean', 'G_std'
+        'Team', 'Season', 'FT%_wt', 'TRB_sum', 'AST_sum', 'AST_top3', 'STL_sum',
+        'TOV_sum', 'PTS_sum', 'PTS_top3', 'G_mean', 'G_std',
+        'PTS_per_game', 'AST_TOV_ratio', 'TRB_per_min', 'MP_per_game'
     ]
     
     # fill any remaining null values
@@ -221,7 +232,7 @@ class NBADataset(Dataset):
         }
 
 class HybridNBAModel(nn.Module):
-    def __init__(self, n_players, n_player_features=12, n_team_features=16):
+    def __init__(self, n_players, n_player_features=12, n_team_features=14):
         super().__init__()
         # player pathway (1D CNN)
         self.player_net = nn.Sequential(
@@ -236,9 +247,13 @@ class HybridNBAModel(nn.Module):
             nn.Linear(64, 128),
             nn.Dropout(0.3)
         )
-        # team pathway (fully connected)
+        # team pathway (deeper: 2 layers instead of 1)
         self.team_net = nn.Sequential(
-            nn.Linear(n_team_features, 128),
+            nn.Linear(n_team_features, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(64, 128),
             nn.BatchNorm1d(128),
             nn.ReLU(),
             nn.Dropout(0.3)
@@ -297,11 +312,11 @@ def train_and_evaluate_2025_only(base_path, output_dir="Results"):
     if len(historical_seasons) == 0:
         raise ValueError("No historical playoff data found for training")
     
-    # Split seasons into 90% train and 10% test
+    # Split seasons into 80% train and 20% test (better evaluation)
     np.random.seed(42)  # For reproducibility
     shuffled_seasons = historical_seasons.copy()
     np.random.shuffle(shuffled_seasons)
-    n_train_seasons = int(0.9 * len(shuffled_seasons))
+    n_train_seasons = int(0.8 * len(shuffled_seasons))
     train_seasons = sorted(shuffled_seasons[:n_train_seasons])
     test_seasons = sorted(shuffled_seasons[n_train_seasons:])
     
@@ -343,23 +358,56 @@ def train_and_evaluate_2025_only(base_path, output_dir="Results"):
     test_team_clean = np.nan_to_num(X_team_test, nan=0)
     X_team_test_scaled = team_scaler.transform(test_team_clean)
     
-    # Create training and test datasets (with original indices for mapping back to metadata)
+    # Split training data into train (80%) and validation (20%) for early stopping
     train_indices = np.arange(len(y_train))
-    test_indices = np.arange(len(y_test))
-    train_dataset = NBADataset(X_player_train_scaled, X_team_train_scaled, y_train, original_indices=train_indices)
-    test_dataset = NBADataset(X_player_test_scaled, X_team_test_scaled, y_test, original_indices=test_indices)
+    np.random.seed(42)
+    np.random.shuffle(train_indices)
+    n_train_samples = int(0.8 * len(train_indices))
+    train_sample_indices = train_indices[:n_train_samples]
+    val_sample_indices = train_indices[n_train_samples:]
+    
+    # Create datasets
+    train_dataset = NBADataset(
+        X_player_train_scaled[train_sample_indices], 
+        X_team_train_scaled[train_sample_indices], 
+        y_train[train_sample_indices], 
+        original_indices=train_sample_indices
+    )
+    val_dataset = NBADataset(
+        X_player_train_scaled[val_sample_indices],
+        X_team_train_scaled[val_sample_indices],
+        y_train[val_sample_indices],
+        original_indices=val_sample_indices
+    )
+    test_dataset = NBADataset(X_player_test_scaled, X_team_test_scaled, y_test, original_indices=np.arange(len(y_test)))
+    
     train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=8, shuffle=False)
     
-    # Initialize and train model on training data only
-    model = HybridNBAModel(n_players=X_player_train.shape[1])
+    # Initialize and train model with early stopping and LR scheduling
+    # Team features: 14 features (removed 6 negative-importance features, added 4 derived features)
+    n_team_features = X_team_train_scaled.shape[1]
+    model = HybridNBAModel(n_players=X_player_train.shape[1], n_team_features=n_team_features)
     optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
     criterion = nn.MSELoss()
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+    
+    # Early stopping parameters
+    best_val_loss = float('inf')
+    patience = 10
+    patience_counter = 0
+    best_model_state = None
+    max_epochs = 200  # Increased max epochs since we have early stopping
     
     print(f"\n=== Training on {len(train_dataset)} team-seasons from {len(train_seasons)} seasons ===")
+    print(f"Validation set: {len(val_dataset)} team-seasons")
+    print(f"Test set: {len(test_dataset)} team-seasons from {len(test_seasons)} seasons\n")
+    
     model.train()
-    for epoch in range(75):
-        epoch_loss = 0.0
+    for epoch in range(max_epochs):
+        # Training phase
+        epoch_train_loss = 0.0
         for batch in train_loader:
             optimizer.zero_grad()
             outputs = model(batch['player_stats'], batch['team_features'])
@@ -367,9 +415,45 @@ def train_and_evaluate_2025_only(base_path, output_dir="Results"):
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            epoch_loss += loss.item()
+            epoch_train_loss += loss.item()
+        
+        # Validation phase
+        model.eval()
+        epoch_val_loss = 0.0
+        with torch.no_grad():
+            for batch in val_loader:
+                outputs = model(batch['player_stats'], batch['team_features'])
+                loss = criterion(outputs, batch['target'])
+                epoch_val_loss += loss.item()
+        model.train()
+        
+        train_loss_avg = epoch_train_loss / len(train_loader)
+        val_loss_avg = epoch_val_loss / len(val_loader)
+        
+        # Learning rate scheduling
+        scheduler.step(val_loss_avg)
+        
+        # Early stopping check
+        if val_loss_avg < best_val_loss:
+            best_val_loss = val_loss_avg
+            patience_counter = 0
+            best_model_state = model.state_dict().copy()
+        else:
+            patience_counter += 1
+        
         if (epoch + 1) % 10 == 0 or epoch == 0:
-            print(f"Epoch {epoch+1}, Train Loss: {epoch_loss/len(train_loader):.4f}")
+            print(f"Epoch {epoch+1}/{max_epochs}, Train Loss: {train_loss_avg:.4f}, Val Loss: {val_loss_avg:.4f} (Best: {best_val_loss:.4f})")
+        
+        # Early stopping
+        if patience_counter >= patience:
+            print(f"\nEarly stopping at epoch {epoch+1} (patience={patience})")
+            print(f"Best validation loss: {best_val_loss:.4f} at epoch {epoch+1-patience}")
+            break
+    
+    # Load best model
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+        print(f"\nLoaded best model with validation loss: {best_val_loss:.4f}")
     
     # Evaluate on test set
     print(f"\n=== Evaluating on test set ({len(test_dataset)} team-seasons from {len(test_seasons)} seasons) ===")
