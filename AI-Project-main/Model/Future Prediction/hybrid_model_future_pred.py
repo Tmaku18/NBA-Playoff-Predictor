@@ -109,7 +109,24 @@ def preprocess_data(player_df, playoff_df, fit_scalers=False, player_scaler=None
         ast_sum = group['AST'].sum()
         tov_sum = group['TOV'].sum()
         trb_sum = group['TRB'].sum()
+        stl_sum = group['STL'].sum()
+        blk_sum = group['BLK'].sum()
         g_mean = group['G'].mean()
+        n_players = len(group)
+        
+        # Top player features
+        pts_top3 = group['PTS'].nlargest(3).mean() if n_players >= 3 else 0
+        pts_top5 = group['PTS'].nlargest(5).mean() if n_players >= 5 else pts_top3
+        ast_top3 = group['AST'].nlargest(3).mean() if n_players >= 3 else 0
+        ast_top5 = group['AST'].nlargest(5).mean() if n_players >= 5 else ast_top3
+        
+        # Defensive efficiency features
+        defensive_activity = stl_sum + blk_sum  # Combined steals and blocks
+        defensive_per_game = defensive_activity / max(g_mean, 1)
+        
+        # Team chemistry/distribution metrics
+        pts_std = group['PTS'].std() if n_players > 1 else 0
+        ast_std = group['AST'].std() if n_players > 1 else 0
         
         agg_dict = {
             'Team': team,
@@ -118,18 +135,26 @@ def preprocess_data(player_df, playoff_df, fit_scalers=False, player_scaler=None
             'FT%_wt': weighted_avg(group, 'FT%'),
             'TRB_sum': trb_sum,
             'AST_sum': ast_sum,
-            'AST_top3': group['AST'].nlargest(3).mean() if len(group) >= 3 else 0,
-            'STL_sum': group['STL'].sum(),
+            'AST_top3': ast_top3,
+            'AST_top5': ast_top5,  # New: top-5 assists
+            'STL_sum': stl_sum,
             'TOV_sum': tov_sum,
             'PTS_sum': pts_sum,
-            'PTS_top3': group['PTS'].nlargest(3).mean() if len(group) >= 3 else 0,
+            'PTS_top3': pts_top3,
+            'PTS_top5': pts_top5,  # New: top-5 points
             'G_mean': g_mean,
             'G_std': group['G'].std(),
             # Derived efficiency features
             'PTS_per_game': pts_sum / max(g_mean, 1),  # Points per game average
             'AST_TOV_ratio': ast_sum / max(tov_sum, 1),  # Assist-to-turnover ratio
             'TRB_per_min': trb_sum / max(mp_sum, 1),  # Rebounds per minute
-            'MP_per_game': mp_sum / max(g_mean, 1)  # Minutes per game (normalized)
+            'MP_per_game': mp_sum / max(g_mean, 1),  # Minutes per game (normalized)
+            # New: Defensive efficiency features
+            'Defensive_activity': defensive_activity,  # STL + BLK combined
+            'Defensive_per_game': defensive_per_game,  # Defensive stats per game
+            # New: Team chemistry/distribution metrics
+            'PTS_std': pts_std,  # Scoring distribution
+            'AST_std': ast_std  # Assist distribution
         }
         team_agg_list.append(agg_dict)
     
@@ -138,11 +163,12 @@ def preprocess_data(player_df, playoff_df, fit_scalers=False, player_scaler=None
     # Handle infinite values from division
     team_agg = team_agg.replace([np.inf, -np.inf], 0)
     
-    # flatten multi-index columns (now 16 features instead of 18)
+    # flatten multi-index columns (now 20 features: 14 original + 6 new)
     team_agg.columns = [
-        'Team', 'Season', 'FT%_wt', 'TRB_sum', 'AST_sum', 'AST_top3', 'STL_sum',
-        'TOV_sum', 'PTS_sum', 'PTS_top3', 'G_mean', 'G_std',
-        'PTS_per_game', 'AST_TOV_ratio', 'TRB_per_min', 'MP_per_game'
+        'Team', 'Season', 'FT%_wt', 'TRB_sum', 'AST_sum', 'AST_top3', 'AST_top5',
+        'STL_sum', 'TOV_sum', 'PTS_sum', 'PTS_top3', 'PTS_top5', 'G_mean', 'G_std',
+        'PTS_per_game', 'AST_TOV_ratio', 'TRB_per_min', 'MP_per_game',
+        'Defensive_activity', 'Defensive_per_game', 'PTS_std', 'AST_std'
     ]
     
     # fill any remaining null values
@@ -232,7 +258,7 @@ class NBADataset(Dataset):
         }
 
 class HybridNBAModel(nn.Module):
-    def __init__(self, n_players, n_player_features=12, n_team_features=14):
+    def __init__(self, n_players, n_player_features=12, n_team_features=20, dropout_rate=0.3):
         super().__init__()
         # player pathway (1D CNN)
         self.player_net = nn.Sequential(
@@ -245,18 +271,18 @@ class HybridNBAModel(nn.Module):
             nn.AdaptiveAvgPool1d(1),  # Reduces player dimension to 1
             nn.Flatten(),
             nn.Linear(64, 128),
-            nn.Dropout(0.3)
+            nn.Dropout(dropout_rate)
         )
         # team pathway (deeper: 2 layers instead of 1)
         self.team_net = nn.Sequential(
             nn.Linear(n_team_features, 64),
             nn.BatchNorm1d(64),
             nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(dropout_rate),
             nn.Linear(64, 128),
             nn.BatchNorm1d(128),
             nn.ReLU(),
-            nn.Dropout(0.3)
+            nn.Dropout(dropout_rate)
         )
         
         # combined network
@@ -264,7 +290,7 @@ class HybridNBAModel(nn.Module):
             nn.Linear(256, 128),  # 128 from player + 128 from team
             nn.BatchNorm1d(128),
             nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(dropout_rate),
             nn.Linear(128, 1)  # Final prediction
         )
     
@@ -386,9 +412,11 @@ def train_and_evaluate_2025_only(base_path, output_dir="Results"):
     test_loader = DataLoader(test_dataset, batch_size=8, shuffle=False)
     
     # Initialize and train model with early stopping and LR scheduling
-    # Team features: 14 features (removed 6 negative-importance features, added 4 derived features)
+    # Team features: 18 features (removed 6 negative-importance features, added 4 derived + 6 new features)
     n_team_features = X_team_train_scaled.shape[1]
-    model = HybridNBAModel(n_players=X_player_train.shape[1], n_team_features=n_team_features)
+    # Try different dropout rates - start with 0.3, can test 0.2 and 0.4
+    dropout_rate = 0.3
+    model = HybridNBAModel(n_players=X_player_train.shape[1], n_team_features=n_team_features, dropout_rate=dropout_rate)
     optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
     criterion = nn.MSELoss()
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
