@@ -128,6 +128,10 @@ def preprocess_data(player_df, playoff_df, fit_scalers=False, player_scaler=None
         pts_std = group['PTS'].std() if n_players > 1 else 0
         ast_std = group['AST'].std() if n_players > 1 else 0
         
+        # Temporal features: encode season as years since 2003
+        year_start = int(season.split('-')[0])
+        years_since_2003 = year_start - 2003
+        
         agg_dict = {
             'Team': team,
             'Season': season,
@@ -154,7 +158,9 @@ def preprocess_data(player_df, playoff_df, fit_scalers=False, player_scaler=None
             'Defensive_per_game': defensive_per_game,  # Defensive stats per game
             # New: Team chemistry/distribution metrics
             'PTS_std': pts_std,  # Scoring distribution
-            'AST_std': ast_std  # Assist distribution
+            'AST_std': ast_std,  # Assist distribution
+            # New: Temporal features
+            'Years_since_2003': years_since_2003  # Season encoding for temporal trends
         }
         team_agg_list.append(agg_dict)
     
@@ -163,12 +169,12 @@ def preprocess_data(player_df, playoff_df, fit_scalers=False, player_scaler=None
     # Handle infinite values from division
     team_agg = team_agg.replace([np.inf, -np.inf], 0)
     
-    # flatten multi-index columns (now 20 features: 14 original + 6 new)
+    # flatten multi-index columns (now 21 features: 14 original + 6 new + 1 temporal)
     team_agg.columns = [
         'Team', 'Season', 'FT%_wt', 'TRB_sum', 'AST_sum', 'AST_top3', 'AST_top5',
         'STL_sum', 'TOV_sum', 'PTS_sum', 'PTS_top3', 'PTS_top5', 'G_mean', 'G_std',
         'PTS_per_game', 'AST_TOV_ratio', 'TRB_per_min', 'MP_per_game',
-        'Defensive_activity', 'Defensive_per_game', 'PTS_std', 'AST_std'
+        'Defensive_activity', 'Defensive_per_game', 'PTS_std', 'AST_std', 'Years_since_2003'
     ]
     
     # fill any remaining null values
@@ -258,18 +264,28 @@ class NBADataset(Dataset):
         }
 
 class HybridNBAModel(nn.Module):
-    def __init__(self, n_players, n_player_features=12, n_team_features=20, dropout_rate=0.3):
+    def __init__(self, n_players, n_player_features=12, n_team_features=21, dropout_rate=0.3, use_attention=True):
         super().__init__()
-        # player pathway (1D CNN)
-        self.player_net = nn.Sequential(
-            nn.Conv1d(n_player_features, 32, 3, padding=1),
-            nn.BatchNorm1d(32),
-            nn.ReLU(),
-            nn.Conv1d(32, 64, 3, padding=1),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool1d(1),  # Reduces player dimension to 1
-            nn.Flatten(),
+        self.use_attention = use_attention
+        
+        # Player pathway with attention mechanism
+        self.player_conv1 = nn.Conv1d(n_player_features, 32, 3, padding=1)
+        self.player_bn1 = nn.BatchNorm1d(32)
+        self.player_conv2 = nn.Conv1d(32, 64, 3, padding=1)
+        self.player_bn2 = nn.BatchNorm1d(64)
+        
+        if use_attention:
+            # Attention mechanism to weight important players
+            self.attention = nn.Sequential(
+                nn.Linear(64, 32),
+                nn.Tanh(),
+                nn.Linear(32, 1)
+            )
+        else:
+            # Fallback to average pooling
+            self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        
+        self.player_fc = nn.Sequential(
             nn.Linear(64, 128),
             nn.Dropout(dropout_rate)
         )
@@ -297,7 +313,33 @@ class HybridNBAModel(nn.Module):
     def forward(self, player_stats, team_features):
         # player stats: [batch, players, features] -> [batch, features, players]
         player_stats = player_stats.permute(0, 2, 1)
-        player_out = self.player_net(player_stats)
+        
+        # Convolutional layers
+        x = self.player_conv1(player_stats)
+        x = self.player_bn1(x)
+        x = torch.relu(x)
+        x = self.player_conv2(x)
+        x = self.player_bn2(x)
+        x = torch.relu(x)
+        
+        # Attention mechanism or average pooling
+        if self.use_attention:
+            # x shape: [batch, 64, players]
+            # Transpose to [batch, players, 64] for attention
+            x_transposed = x.permute(0, 2, 1)  # [batch, players, 64]
+            # Compute attention weights
+            attention_weights = self.attention(x_transposed)  # [batch, players, 1]
+            attention_weights = torch.softmax(attention_weights, dim=1)  # Normalize across players
+            # Apply attention: weighted sum
+            player_out = torch.sum(attention_weights * x_transposed, dim=1)  # [batch, 64]
+        else:
+            # Average pooling fallback
+            x = self.avg_pool(x)  # [batch, 64, 1]
+            player_out = x.squeeze(-1)  # [batch, 64]
+        
+        # Final fully connected layer
+        player_out = self.player_fc(player_out)  # [batch, 128]
+        
         team_out = self.team_net(team_features)
         return self.combined(torch.cat([player_out, team_out], dim=1)).squeeze()
 
@@ -407,17 +449,29 @@ def train_and_evaluate_2025_only(base_path, output_dir="Results"):
     )
     test_dataset = NBADataset(X_player_test_scaled, X_team_test_scaled, y_test, original_indices=np.arange(len(y_test)))
     
-    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=8, shuffle=False)
+    # Hyperparameters (optimized via hyperparameter tuning)
+    # Best config: dropout=0.2, lr=0.0005, batch=8, wd=0.0001 -> Spearman=0.3620
+    dropout_rate = 0.2
+    learning_rate = 0.0005
+    batch_size = 8
+    weight_decay = 1e-4
+    use_attention = True  # Enable attention mechanism
+    
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     
     # Initialize and train model with early stopping and LR scheduling
-    # Team features: 18 features (removed 6 negative-importance features, added 4 derived + 6 new features)
+    # Team features: 21 features (removed 6 negative-importance features, added 4 derived + 6 new + 1 temporal)
     n_team_features = X_team_train_scaled.shape[1]
-    # Try different dropout rates - start with 0.3, can test 0.2 and 0.4
-    dropout_rate = 0.3
-    model = HybridNBAModel(n_players=X_player_train.shape[1], n_team_features=n_team_features, dropout_rate=dropout_rate)
-    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
+    
+    model = HybridNBAModel(
+        n_players=X_player_train.shape[1], 
+        n_team_features=n_team_features, 
+        dropout_rate=dropout_rate,
+        use_attention=use_attention
+    )
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     criterion = nn.MSELoss()
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
     
@@ -426,7 +480,7 @@ def train_and_evaluate_2025_only(base_path, output_dir="Results"):
     patience = 10
     patience_counter = 0
     best_model_state = None
-    max_epochs = 200  # Increased max epochs since we have early stopping
+    max_epochs = 300  # Increased max epochs for attention mechanism to converge
     
     print(f"\n=== Training on {len(train_dataset)} team-seasons from {len(train_seasons)} seasons ===")
     print(f"Validation set: {len(val_dataset)} team-seasons")
