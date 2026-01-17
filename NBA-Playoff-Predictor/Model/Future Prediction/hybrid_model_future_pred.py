@@ -262,6 +262,91 @@ class NBADataset(Dataset):
             'target': self.targets[idx],
             'original_idx': self.original_indices[idx]
         }
+    
+    def get_season_groups(self, meta_df):
+        """Get season group indices for rank-aware loss"""
+        season_to_idx = {season: idx for idx, season in enumerate(sorted(meta_df['Season'].unique()))}
+        return torch.LongTensor([season_to_idx[meta_df.iloc[self.original_indices[i]]['Season']] 
+                                 for i in range(len(self))])
+
+class RankAwareLoss(nn.Module):
+    """Combined loss: MSE for regression + rank-aware component for ranking accuracy"""
+    def __init__(self, mse_weight=0.7, rank_weight=0.3):
+        super().__init__()
+        self.mse_weight = mse_weight
+        self.rank_weight = rank_weight
+        self.mse_loss = nn.MSELoss()
+    
+    def forward(self, predictions, targets, season_groups=None):
+        """
+        Args:
+            predictions: tensor of predicted values
+            targets: tensor of actual values
+            season_groups: optional tensor indicating which season each sample belongs to
+                          (for computing rank correlation within seasons)
+        """
+        # MSE component
+        mse = self.mse_loss(predictions, targets)
+        
+        # Rank-aware component: Spearman correlation loss
+        # We want to maximize correlation, so we minimize (1 - correlation)
+        if season_groups is not None:
+            # Compute rank correlation within each season
+            rank_losses = []
+            unique_seasons = torch.unique(season_groups)
+            for season in unique_seasons:
+                mask = (season_groups == season)
+                if mask.sum() < 2:  # Need at least 2 samples for correlation
+                    continue
+                
+                pred_season = predictions[mask]
+                target_season = targets[mask]
+                
+                # Compute ranks
+                pred_ranks = torch.argsort(torch.argsort(pred_season.squeeze(), descending=False))
+                target_ranks = torch.argsort(torch.argsort(target_season.squeeze(), descending=False))
+                
+                # Normalize ranks to [0, 1]
+                n = len(pred_ranks)
+                pred_ranks_norm = pred_ranks.float() / (n - 1) if n > 1 else pred_ranks.float()
+                target_ranks_norm = target_ranks.float() / (n - 1) if n > 1 else target_ranks.float()
+                
+                # Compute correlation (simplified: 1 - cosine similarity of ranks)
+                pred_centered = pred_ranks_norm - pred_ranks_norm.mean()
+                target_centered = target_ranks_norm - target_ranks_norm.mean()
+                
+                numerator = (pred_centered * target_centered).sum()
+                pred_std = torch.sqrt((pred_centered ** 2).sum() + 1e-8)
+                target_std = torch.sqrt((target_centered ** 2).sum() + 1e-8)
+                
+                correlation = numerator / (pred_std * target_std + 1e-8)
+                rank_losses.append(1.0 - correlation)  # Minimize (1 - correlation)
+            
+            if len(rank_losses) > 0:
+                rank_loss = torch.stack(rank_losses).mean()
+            else:
+                rank_loss = torch.tensor(0.0, device=predictions.device)
+        else:
+            # Global rank correlation
+            pred_ranks = torch.argsort(torch.argsort(predictions.squeeze(), descending=False))
+            target_ranks = torch.argsort(torch.argsort(targets.squeeze(), descending=False))
+            
+            n = len(pred_ranks)
+            pred_ranks_norm = pred_ranks.float() / (n - 1) if n > 1 else pred_ranks.float()
+            target_ranks_norm = target_ranks.float() / (n - 1) if n > 1 else target_ranks.float()
+            
+            pred_centered = pred_ranks_norm - pred_ranks_norm.mean()
+            target_centered = target_ranks_norm - target_ranks_norm.mean()
+            
+            numerator = (pred_centered * target_centered).sum()
+            pred_std = torch.sqrt((pred_centered ** 2).sum() + 1e-8)
+            target_std = torch.sqrt((target_centered ** 2).sum() + 1e-8)
+            
+            correlation = numerator / (pred_std * target_std + 1e-8)
+            rank_loss = (1.0 - correlation).to(predictions.device)
+        
+        total_loss = self.mse_weight * mse + self.rank_weight * rank_loss
+        return total_loss, mse, rank_loss
 
 class HybridNBAModel(nn.Module):
     def __init__(self, n_players, n_player_features=12, n_team_features=21, dropout_rate=0.3, use_attention=True):
@@ -456,6 +541,8 @@ def train_and_evaluate_2025_only(base_path, output_dir="Results"):
     batch_size = 8
     weight_decay = 1e-4
     use_attention = True  # Enable attention mechanism
+    use_rank_aware_loss = True  # Phase 3: Use rank-aware loss
+    n_ensemble_models = 5  # Phase 3: Number of ensemble models
     
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
@@ -465,107 +552,163 @@ def train_and_evaluate_2025_only(base_path, output_dir="Results"):
     # Team features: 21 features (removed 6 negative-importance features, added 4 derived + 6 new + 1 temporal)
     n_team_features = X_team_train_scaled.shape[1]
     
-    model = HybridNBAModel(
-        n_players=X_player_train.shape[1], 
-        n_team_features=n_team_features, 
-        dropout_rate=dropout_rate,
-        use_attention=use_attention
-    )
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    criterion = nn.MSELoss()
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+    # Phase 3: Train ensemble of models
+    ensemble_models = []
+    print(f"\n=== Training Ensemble of {n_ensemble_models} Models ===")
     
-    # Early stopping parameters
-    best_val_loss = float('inf')
-    patience = 10
-    patience_counter = 0
-    best_model_state = None
-    max_epochs = 300  # Increased max epochs for attention mechanism to converge
-    
-    print(f"\n=== Training on {len(train_dataset)} team-seasons from {len(train_seasons)} seasons ===")
-    print(f"Validation set: {len(val_dataset)} team-seasons")
-    print(f"Test set: {len(test_dataset)} team-seasons from {len(test_seasons)} seasons\n")
-    
-    model.train()
-    for epoch in range(max_epochs):
-        # Training phase
-        epoch_train_loss = 0.0
-        for batch in train_loader:
-            optimizer.zero_grad()
-            outputs = model(batch['player_stats'], batch['team_features'])
-            loss = criterion(outputs, batch['target'])
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            epoch_train_loss += loss.item()
+    for ensemble_idx in range(n_ensemble_models):
+        print(f"\n--- Training Model {ensemble_idx + 1}/{n_ensemble_models} ---")
         
-        # Validation phase
-        model.eval()
-        epoch_val_loss = 0.0
-        with torch.no_grad():
-            for batch in val_loader:
-                outputs = model(batch['player_stats'], batch['team_features'])
-                loss = criterion(outputs, batch['target'])
-                epoch_val_loss += loss.item()
-        model.train()
+        # Initialize model with different random seed for each ensemble member
+        torch.manual_seed(42 + ensemble_idx)
+        np.random.seed(42 + ensemble_idx)
         
-        train_loss_avg = epoch_train_loss / len(train_loader)
-        val_loss_avg = epoch_val_loss / len(val_loader)
+        model = HybridNBAModel(
+            n_players=X_player_train.shape[1], 
+            n_team_features=n_team_features, 
+            dropout_rate=dropout_rate,
+            use_attention=use_attention
+        )
+        optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
         
-        # Learning rate scheduling
-        scheduler.step(val_loss_avg)
-        
-        # Early stopping check
-        if val_loss_avg < best_val_loss:
-            best_val_loss = val_loss_avg
-            patience_counter = 0
-            best_model_state = model.state_dict().copy()
+        # Phase 3: Use rank-aware loss
+        if use_rank_aware_loss:
+            criterion = RankAwareLoss(mse_weight=0.7, rank_weight=0.3)
         else:
-            patience_counter += 1
+            criterion = nn.MSELoss()
         
-        if (epoch + 1) % 10 == 0 or epoch == 0:
-            print(f"Epoch {epoch+1}/{max_epochs}, Train Loss: {train_loss_avg:.4f}, Val Loss: {val_loss_avg:.4f} (Best: {best_val_loss:.4f})")
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
         
-        # Early stopping
-        if patience_counter >= patience:
-            print(f"\nEarly stopping at epoch {epoch+1} (patience={patience})")
-            print(f"Best validation loss: {best_val_loss:.4f} at epoch {epoch+1-patience}")
-            break
+        # Early stopping parameters for this model
+        best_val_loss = float('inf')
+        patience = 10
+        patience_counter = 0
+        best_model_state = None
+        max_epochs = 200  # Reduced for ensemble training
+        
+        model.train()
+        for epoch in range(max_epochs):
+            # Training phase
+            epoch_train_loss = 0.0
+            epoch_train_mse = 0.0
+            epoch_train_rank = 0.0
+            
+            for batch in train_loader:
+                optimizer.zero_grad()
+                outputs = model(batch['player_stats'], batch['team_features'])
+                
+                # Get season groups for rank-aware loss
+                if use_rank_aware_loss:
+                    # Get season indices for this batch
+                    batch_indices = batch['original_idx'].numpy()
+                    batch_seasons = [meta_train.iloc[idx]['Season'] for idx in batch_indices]
+                    unique_seasons = sorted(set(batch_seasons))
+                    season_to_idx = {s: i for i, s in enumerate(unique_seasons)}
+                    season_groups = torch.LongTensor([season_to_idx[s] for s in batch_seasons])
+                    
+                    loss, mse_loss, rank_loss = criterion(outputs, batch['target'], season_groups)
+                    epoch_train_mse += mse_loss.item()
+                    epoch_train_rank += rank_loss.item()
+                else:
+                    loss = criterion(outputs, batch['target'])
+                
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                epoch_train_loss += loss.item() if isinstance(loss, torch.Tensor) else loss[0].item()
+            
+            # Validation phase
+            model.eval()
+            epoch_val_loss = 0.0
+            with torch.no_grad():
+                for batch in val_loader:
+                    outputs = model(batch['player_stats'], batch['team_features'])
+                    if use_rank_aware_loss:
+                        batch_indices = batch['original_idx'].numpy()
+                        batch_seasons = [meta_train.iloc[idx]['Season'] for idx in batch_indices]
+                        unique_seasons = sorted(set(batch_seasons))
+                        season_to_idx = {s: i for i, s in enumerate(unique_seasons)}
+                        season_groups = torch.LongTensor([season_to_idx[s] for s in batch_seasons])
+                        loss, _, _ = criterion(outputs, batch['target'], season_groups)
+                    else:
+                        loss = criterion(outputs, batch['target'])
+                    epoch_val_loss += loss.item() if isinstance(loss, torch.Tensor) else loss[0].item()
+            model.train()
+            
+            train_loss_avg = epoch_train_loss / len(train_loader)
+            val_loss_avg = epoch_val_loss / len(val_loader)
+            
+            # Learning rate scheduling
+            scheduler.step(val_loss_avg)
+            
+            # Early stopping check
+            if val_loss_avg < best_val_loss:
+                best_val_loss = val_loss_avg
+                patience_counter = 0
+                best_model_state = model.state_dict().copy()
+            else:
+                patience_counter += 1
+            
+            if (epoch + 1) % 20 == 0 or epoch == 0:
+                if use_rank_aware_loss:
+                    print(f"  Epoch {epoch+1}/{max_epochs}, Train Loss: {train_loss_avg:.4f} (MSE: {epoch_train_mse/len(train_loader):.4f}, Rank: {epoch_train_rank/len(train_loader):.4f}), Val Loss: {val_loss_avg:.4f}")
+                else:
+                    print(f"  Epoch {epoch+1}/{max_epochs}, Train Loss: {train_loss_avg:.4f}, Val Loss: {val_loss_avg:.4f}")
+            
+            # Early stopping
+            if patience_counter >= patience:
+                break
+        
+        # Load best model
+        if best_model_state is not None:
+            model.load_state_dict(best_model_state)
+        
+        ensemble_models.append(model)
+        print(f"  Model {ensemble_idx + 1} trained. Best validation loss: {best_val_loss:.4f}")
     
-    # Load best model
-    if best_model_state is not None:
-        model.load_state_dict(best_model_state)
-        print(f"\nLoaded best model with validation loss: {best_val_loss:.4f}")
+    print(f"\n=== Ensemble Training Complete ===\n")
     
-    # Evaluate on test set
-    print(f"\n=== Evaluating on test set ({len(test_dataset)} team-seasons from {len(test_seasons)} seasons) ===")
-    model.eval()
-    test_loss = 0.0
-    test_predictions = []
+    # Phase 3: Evaluate ensemble on test set
+    print(f"\n=== Evaluating Ensemble on test set ({len(test_dataset)} team-seasons from {len(test_seasons)} seasons) ===")
+    
+    # Collect predictions from all ensemble models
+    ensemble_predictions = []
     test_targets = []
     test_teams = []
     test_seasons_list = []
     
+    for model in ensemble_models:
+        model.eval()
+    
     with torch.no_grad():
         for batch in test_loader:
-            outputs = model(batch['player_stats'], batch['team_features'])
-            loss = criterion(outputs, batch['target'])
-            test_loss += loss.item()
-            test_predictions.extend(outputs.numpy())
-            test_targets.extend(batch['target'].numpy())
-            # Get team names and seasons from meta_test
+            # Get predictions from all models
+            batch_predictions = []
+            for model in ensemble_models:
+                outputs = model(batch['player_stats'], batch['team_features'])
+                batch_predictions.append(outputs.numpy())
+            
+            # Average predictions across ensemble
+            ensemble_batch_pred = np.mean(batch_predictions, axis=0)
+            ensemble_predictions.extend(ensemble_batch_pred.flatten())
+            
+            # Collect targets and metadata (only once)
+            test_targets.extend(batch['target'].numpy().flatten())
             for idx in batch['original_idx'].numpy():
                 test_teams.append(meta_test.iloc[idx]['Team'])
                 test_seasons_list.append(meta_test.iloc[idx]['Season'])
     
-    test_loss_avg = test_loss / len(test_loader)
+    # Calculate MSE loss
+    test_predictions_array = np.array(ensemble_predictions)
+    test_targets_array = np.array(test_targets)
+    test_loss_avg = np.mean((test_predictions_array - test_targets_array) ** 2)
     print(f"Test Loss (MSE): {test_loss_avg:.4f}")
     
     # Calculate per-season rankings and metrics
     test_df = pd.DataFrame({
         'Season': test_seasons_list,
         'Team': test_teams,
-        'Predicted': test_predictions,
+        'Predicted': ensemble_predictions,
         'Actual': test_targets
     })
     
@@ -656,14 +799,23 @@ def train_and_evaluate_2025_only(base_path, output_dir="Results"):
         original_indices=season_indices
     )
 
-    # Predict
-    model.eval()
+    # Phase 3: Predict using ensemble
+    for model in ensemble_models:
+        model.eval()
+    
     full_player = torch.stack([pred_dataset[i]['player_stats'] for i in range(len(pred_dataset))])
     full_team = torch.stack([pred_dataset[i]['team_features'] for i in range(len(pred_dataset))])
     full_indices = [pred_dataset[i]['original_idx'] for i in range(len(pred_dataset))]
 
     with torch.no_grad():
-        full_predictions = model(full_player, full_team).numpy()
+        # Get predictions from all ensemble models
+        ensemble_preds = []
+        for model in ensemble_models:
+            outputs = model(full_player, full_team)
+            ensemble_preds.append(outputs.numpy())
+        
+        # Average predictions across ensemble
+        full_predictions = np.mean(ensemble_preds, axis=0)
 
     predicted_ranks = np.argsort(np.argsort(full_predictions)) + 1
     team_names = meta_2025['Team'].iloc[full_indices].tolist()
@@ -685,7 +837,270 @@ def train_and_evaluate_2025_only(base_path, output_dir="Results"):
 
     return results_2025
 
+# ============ CROSS-VALIDATION FUNCTION ============
+def cross_validate_model(base_path, n_folds=5, output_dir="Results"):
+    """
+    Phase 3: Cross-validation for robust evaluation
+    Splits historical seasons into n_folds and evaluates on each fold
+    """
+    print("=" * 70)
+    print("CROSS-VALIDATION EVALUATION")
+    print("=" * 70)
+    
+    # Load data
+    player_df = load_player_stats(base_path)
+    playoff_df_historical = load_playoff_stats(base_path)
+    
+    historical_seasons = sorted([s for s in playoff_df_historical['Season'].unique() if s != '2024-25'])
+    
+    if len(historical_seasons) < n_folds:
+        print(f"Warning: Only {len(historical_seasons)} seasons available, reducing folds to {len(historical_seasons)}")
+        n_folds = len(historical_seasons)
+    
+    # Split seasons into folds
+    np.random.seed(42)
+    shuffled_seasons = historical_seasons.copy()
+    np.random.shuffle(shuffled_seasons)
+    
+    fold_size = len(shuffled_seasons) // n_folds
+    fold_results = []
+    
+    for fold in range(n_folds):
+        print(f"\n{'='*70}")
+        print(f"FOLD {fold + 1}/{n_folds}")
+        print(f"{'='*70}")
+        
+        # Split into train and test for this fold
+        test_start = fold * fold_size
+        test_end = (fold + 1) * fold_size if fold < n_folds - 1 else len(shuffled_seasons)
+        test_seasons_fold = sorted(shuffled_seasons[test_start:test_end])
+        train_seasons_fold = sorted([s for s in shuffled_seasons if s not in test_seasons_fold])
+        
+        print(f"Train seasons ({len(train_seasons_fold)}): {train_seasons_fold[:5]}...")
+        print(f"Test seasons ({len(test_seasons_fold)}): {test_seasons_fold}")
+        
+        # Preprocess
+        playoff_df_train = playoff_df_historical[playoff_df_historical['Season'].isin(train_seasons_fold)]
+        playoff_df_test = playoff_df_historical[playoff_df_historical['Season'].isin(test_seasons_fold)]
+        
+        X_player_train, X_team_train, y_train, meta_train = preprocess_data(
+            player_df, playoff_df_train, fit_scalers=False)
+        X_player_test, X_team_test, y_test, meta_test = preprocess_data(
+            player_df, playoff_df_test, fit_scalers=False)
+        
+        # Fit scalers
+        player_scaler = StandardScaler()
+        train_player_reshaped = X_player_train.reshape(-1, X_player_train.shape[-1])
+        train_player_reshaped = np.nan_to_num(train_player_reshaped, nan=0)
+        player_scaler.fit(train_player_reshaped)
+        
+        team_scaler = StandardScaler()
+        train_team_clean = np.nan_to_num(X_team_train, nan=0)
+        team_scaler.fit(train_team_clean)
+        
+        # Transform
+        X_player_train_scaled = player_scaler.transform(train_player_reshaped).reshape(X_player_train.shape)
+        X_team_train_scaled = team_scaler.transform(train_team_clean)
+        
+        test_player_reshaped = X_player_test.reshape(-1, X_player_test.shape[-1])
+        test_player_reshaped = np.nan_to_num(test_player_reshaped, nan=0)
+        X_player_test_scaled = player_scaler.transform(test_player_reshaped).reshape(X_player_test.shape)
+        
+        test_team_clean = np.nan_to_num(X_team_test, nan=0)
+        X_team_test_scaled = team_scaler.transform(test_team_clean)
+        
+        # Split train/val
+        train_indices = np.arange(len(y_train))
+        np.random.seed(42)
+        np.random.shuffle(train_indices)
+        n_train_samples = int(0.8 * len(train_indices))
+        train_sample_indices = train_indices[:n_train_samples]
+        val_sample_indices = train_indices[n_train_samples:]
+        
+        train_dataset = NBADataset(
+            X_player_train_scaled[train_sample_indices],
+            X_team_train_scaled[train_sample_indices],
+            y_train[train_sample_indices],
+            original_indices=train_sample_indices
+        )
+        val_dataset = NBADataset(
+            X_player_train_scaled[val_sample_indices],
+            X_team_train_scaled[val_sample_indices],
+            y_train[val_sample_indices],
+            original_indices=val_sample_indices
+        )
+        test_dataset = NBADataset(
+            X_player_test_scaled, X_team_test_scaled, y_test,
+            original_indices=np.arange(len(y_test))
+        )
+        
+        # Train ensemble (simplified: 3 models for CV)
+        n_team_features = X_team_train_scaled.shape[1]
+        ensemble_models = []
+        dropout_rate = 0.2
+        learning_rate = 0.0005
+        batch_size = 8
+        weight_decay = 1e-4
+        
+        for ensemble_idx in range(3):  # 3 models for faster CV
+            torch.manual_seed(42 + ensemble_idx)
+            np.random.seed(42 + ensemble_idx)
+            
+            model = HybridNBAModel(
+                n_players=X_player_train.shape[1],
+                n_team_features=n_team_features,
+                dropout_rate=dropout_rate,
+                use_attention=True
+            )
+            optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+            criterion = RankAwareLoss(mse_weight=0.7, rank_weight=0.3)
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+            
+            train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+            val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+            
+            best_val_loss = float('inf')
+            patience = 8
+            patience_counter = 0
+            best_model_state = None
+            max_epochs = 100  # Reduced for CV
+            
+            model.train()
+            for epoch in range(max_epochs):
+                epoch_train_loss = 0.0
+                for batch in train_loader:
+                    optimizer.zero_grad()
+                    outputs = model(batch['player_stats'], batch['team_features'])
+                    
+                    batch_indices = batch['original_idx'].numpy()
+                    batch_seasons = [meta_train.iloc[idx]['Season'] for idx in batch_indices]
+                    unique_seasons = sorted(set(batch_seasons))
+                    season_to_idx = {s: i for i, s in enumerate(unique_seasons)}
+                    season_groups = torch.LongTensor([season_to_idx[s] for s in batch_seasons])
+                    
+                    loss, _, _ = criterion(outputs, batch['target'], season_groups)
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+                    epoch_train_loss += loss.item()
+                
+                model.eval()
+                epoch_val_loss = 0.0
+                with torch.no_grad():
+                    for batch in val_loader:
+                        outputs = model(batch['player_stats'], batch['team_features'])
+                        batch_indices = batch['original_idx'].numpy()
+                        batch_seasons = [meta_train.iloc[idx]['Season'] for idx in batch_indices]
+                        unique_seasons = sorted(set(batch_seasons))
+                        season_to_idx = {s: i for i, s in enumerate(unique_seasons)}
+                        season_groups = torch.LongTensor([season_to_idx[s] for s in batch_seasons])
+                        loss, _, _ = criterion(outputs, batch['target'], season_groups)
+                        epoch_val_loss += loss.item()
+                model.train()
+                
+                val_loss_avg = epoch_val_loss / len(val_loader)
+                scheduler.step(val_loss_avg)
+                
+                if val_loss_avg < best_val_loss:
+                    best_val_loss = val_loss_avg
+                    patience_counter = 0
+                    best_model_state = model.state_dict().copy()
+                else:
+                    patience_counter += 1
+                
+                if patience_counter >= patience:
+                    break
+            
+            if best_model_state is not None:
+                model.load_state_dict(best_model_state)
+            ensemble_models.append(model)
+        
+        # Evaluate on test set
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+        for model in ensemble_models:
+            model.eval()
+        
+        ensemble_predictions = []
+        test_targets = []
+        test_teams = []
+        test_seasons_list = []
+        
+        with torch.no_grad():
+            for batch in test_loader:
+                batch_predictions = []
+                for model in ensemble_models:
+                    outputs = model(batch['player_stats'], batch['team_features'])
+                    batch_predictions.append(outputs.numpy())
+                
+                ensemble_batch_pred = np.mean(batch_predictions, axis=0)
+                ensemble_predictions.extend(ensemble_batch_pred.flatten())
+                test_targets.extend(batch['target'].numpy().flatten())
+                
+                for idx in batch['original_idx'].numpy():
+                    test_teams.append(meta_test.iloc[idx]['Team'])
+                    test_seasons_list.append(meta_test.iloc[idx]['Season'])
+        
+        # Calculate metrics
+        test_df = pd.DataFrame({
+            'Season': test_seasons_list,
+            'Team': test_teams,
+            'Predicted': ensemble_predictions,
+            'Actual': test_targets
+        })
+        
+        test_df['Predicted_Rank'] = test_df.groupby('Season')['Predicted'].rank(method='dense', ascending=True).astype(int)
+        test_df['Actual_Rank'] = test_df.groupby('Season')['Actual'].rank(method='dense', ascending=True).astype(int)
+        
+        overall_actual = test_df['Actual_Rank'].values
+        overall_predicted = test_df['Predicted_Rank'].values
+        spearman = spearmanr(overall_actual, overall_predicted)[0]
+        kendall = kendalltau(overall_actual, overall_predicted)[0]
+        mae = np.mean(np.abs(overall_actual - overall_predicted))
+        perfect = np.sum(overall_actual == overall_predicted)
+        
+        fold_results.append({
+            'Fold': fold + 1,
+            'Test_Seasons': ', '.join(test_seasons_fold),
+            'Spearman': spearman,
+            'Kendall_Tau': kendall,
+            'MAE': mae,
+            'Perfect_Matches': perfect,
+            'Total_Teams': len(overall_actual)
+        })
+        
+        print(f"Fold {fold + 1} Results:")
+        print(f"  Spearman: {spearman:.4f}, Kendall: {kendall:.4f}, MAE: {mae:.2f}, Perfect: {perfect}/{len(overall_actual)}")
+    
+    # Summary
+    cv_results_df = pd.DataFrame(fold_results)
+    mean_spearman = cv_results_df['Spearman'].mean()
+    std_spearman = cv_results_df['Spearman'].std()
+    mean_kendall = cv_results_df['Kendall_Tau'].mean()
+    mean_mae = cv_results_df['MAE'].mean()
+    
+    print(f"\n{'='*70}")
+    print("CROSS-VALIDATION SUMMARY")
+    print(f"{'='*70}")
+    print(cv_results_df.to_string(index=False))
+    print(f"\nMean Spearman: {mean_spearman:.4f} ± {std_spearman:.4f}")
+    print(f"Mean Kendall Tau: {mean_kendall:.4f}")
+    print(f"Mean MAE: {mean_mae:.4f}")
+    
+    # Save results
+    os.makedirs(output_dir, exist_ok=True)
+    cv_results_df.to_csv(os.path.join(output_dir, "cross_validation_results.csv"), index=False)
+    print(f"\nCross-validation results saved to: {os.path.join(output_dir, 'cross_validation_results.csv')}")
+    
+    return cv_results_df
+
     
 if __name__ == "__main__":
+    # Run main training and prediction
     results = train_and_evaluate_2025_only("Preprocessing/Preprocessed Data")
     print(results.head())
+    
+    # Run cross-validation
+    print("\n" + "="*70)
+    print("Running Cross-Validation...")
+    print("="*70)
+    cv_results = cross_validate_model("Preprocessing/Preprocessed Data", n_folds=5)
