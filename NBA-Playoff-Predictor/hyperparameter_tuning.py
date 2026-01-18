@@ -18,11 +18,11 @@ from scipy.stats import spearmanr, kendalltau
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'Model', 'Future Prediction'))
 from hybrid_model_future_pred import (
     load_player_stats, load_playoff_stats, preprocess_data,
-    HybridNBAModel, NBADataset
+    HybridNBAModel, NBADataset, RankAwareLoss
 )
 
 def train_and_evaluate_config(
-    train_dataset, val_dataset, test_dataset, meta_test,
+    train_dataset, val_dataset, test_dataset, meta_train, meta_test,
     dropout_rate, learning_rate, batch_size, weight_decay,
     n_players, n_team_features, max_epochs=200, patience=10
 ):
@@ -41,7 +41,7 @@ def train_and_evaluate_config(
         use_attention=True
     )
     optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    criterion = nn.MSELoss()
+    criterion = RankAwareLoss(mse_weight=0.7, rank_weight=0.3)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
     
     # Training with early stopping
@@ -56,7 +56,15 @@ def train_and_evaluate_config(
         for batch in train_loader:
             optimizer.zero_grad()
             outputs = model(batch['player_stats'], batch['team_features'])
-            loss = criterion(outputs, batch['target'])
+            
+            # Get season groups for rank-aware loss
+            batch_indices = batch['original_idx'].numpy()
+            batch_seasons = [meta_train.iloc[idx]['Season'] for idx in batch_indices]
+            unique_seasons = sorted(set(batch_seasons))
+            season_to_idx = {s: i for i, s in enumerate(unique_seasons)}
+            season_groups = torch.LongTensor([season_to_idx[s] for s in batch_seasons])
+            
+            loss, _, _ = criterion(outputs, batch['target'], season_groups)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -68,7 +76,12 @@ def train_and_evaluate_config(
         with torch.no_grad():
             for batch in val_loader:
                 outputs = model(batch['player_stats'], batch['team_features'])
-                loss = criterion(outputs, batch['target'])
+                batch_indices = batch['original_idx'].numpy()
+                batch_seasons = [meta_train.iloc[idx]['Season'] for idx in batch_indices]
+                unique_seasons = sorted(set(batch_seasons))
+                season_to_idx = {s: i for i, s in enumerate(unique_seasons)}
+                season_groups = torch.LongTensor([season_to_idx[s] for s in batch_seasons])
+                loss, _, _ = criterion(outputs, batch['target'], season_groups)
                 epoch_val_loss += loss.item()
         model.train()
         
@@ -218,10 +231,10 @@ def main():
     n_team_features = X_team_train_scaled.shape[1]
     
     # Hyperparameter grid
-    dropout_rates = [0.2, 0.3, 0.4]
-    learning_rates = [0.0005, 0.001]
-    batch_sizes = [8, 16]
-    weight_decays = [1e-4, 5e-4]
+    dropout_rates = [0.1, 0.15, 0.2]  # Expanded: added 0.1, 0.15
+    learning_rates = [0.0001, 0.0003, 0.0005]  # Expanded: added 0.0001, 0.0003
+    batch_sizes = [4, 8]  # Expanded: added 4
+    weight_decays = [1e-4, 5e-4]  # Unchanged
     
     total_combinations = len(dropout_rates) * len(learning_rates) * len(batch_sizes) * len(weight_decays)
     
@@ -245,7 +258,7 @@ def main():
                     
                     try:
                         result = train_and_evaluate_config(
-                            train_dataset, val_dataset, test_dataset, meta_test,
+                            train_dataset, val_dataset, test_dataset, meta_train, meta_test,
                             dropout_rate, learning_rate, batch_size, weight_decay,
                             X_player_train.shape[1], n_team_features,
                             max_epochs=150, patience=8  # Reduced for faster tuning

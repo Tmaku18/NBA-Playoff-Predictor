@@ -135,14 +135,13 @@ def preprocess_data(player_df, playoff_df, fit_scalers=False, player_scaler=None
         agg_dict = {
             'Team': team,
             'Season': season,
-            # Removed: MP_sum, FG%_wt, 3P%_wt, eFG%_wt, BLK_sum, PF_sum (negative importance)
+            # Removed: MP_sum, FG%_wt, 3P%_wt, eFG%_wt, BLK_sum, PF_sum, TOV_sum (negative importance)
             'FT%_wt': weighted_avg(group, 'FT%'),
             'TRB_sum': trb_sum,
             'AST_sum': ast_sum,
             'AST_top3': ast_top3,
             'AST_top5': ast_top5,  # New: top-5 assists
             'STL_sum': stl_sum,
-            'TOV_sum': tov_sum,
             'PTS_sum': pts_sum,
             'PTS_top3': pts_top3,
             'PTS_top5': pts_top5,  # New: top-5 points
@@ -169,10 +168,10 @@ def preprocess_data(player_df, playoff_df, fit_scalers=False, player_scaler=None
     # Handle infinite values from division
     team_agg = team_agg.replace([np.inf, -np.inf], 0)
     
-    # flatten multi-index columns (now 21 features: 14 original + 6 new + 1 temporal)
+    # flatten multi-index columns (now 20 features: 13 original + 6 new + 1 temporal)
     team_agg.columns = [
         'Team', 'Season', 'FT%_wt', 'TRB_sum', 'AST_sum', 'AST_top3', 'AST_top5',
-        'STL_sum', 'TOV_sum', 'PTS_sum', 'PTS_top3', 'PTS_top5', 'G_mean', 'G_std',
+        'STL_sum', 'PTS_sum', 'PTS_top3', 'PTS_top5', 'G_mean', 'G_std',
         'PTS_per_game', 'AST_TOV_ratio', 'TRB_per_min', 'MP_per_game',
         'Defensive_activity', 'Defensive_per_game', 'PTS_std', 'AST_std', 'Years_since_2003'
     ]
@@ -349,7 +348,7 @@ class RankAwareLoss(nn.Module):
         return total_loss, mse, rank_loss
 
 class HybridNBAModel(nn.Module):
-    def __init__(self, n_players, n_player_features=12, n_team_features=21, dropout_rate=0.3, use_attention=True):
+    def __init__(self, n_players, n_player_features=12, n_team_features=20, dropout_rate=0.3, use_attention=True):
         super().__init__()
         self.use_attention = use_attention
         
@@ -534,22 +533,22 @@ def train_and_evaluate_2025_only(base_path, output_dir="Results"):
     )
     test_dataset = NBADataset(X_player_test_scaled, X_team_test_scaled, y_test, original_indices=np.arange(len(y_test)))
     
-    # Hyperparameters (optimized via hyperparameter tuning)
-    # Best config: dropout=0.2, lr=0.0005, batch=8, wd=0.0001 -> Spearman=0.3620
-    dropout_rate = 0.2
+    # Hyperparameters (optimized via hyperparameter tuning with RankAwareLoss)
+    # Best config: dropout=0.1, lr=0.0005, batch=8, wd=0.0005 -> Spearman=0.4342
+    dropout_rate = 0.1
     learning_rate = 0.0005
     batch_size = 8
-    weight_decay = 1e-4
+    weight_decay = 5e-4
     use_attention = True  # Enable attention mechanism
     use_rank_aware_loss = True  # Phase 3: Use rank-aware loss
-    n_ensemble_models = 5  # Phase 3: Number of ensemble models
+    n_ensemble_models = 20  # Phase 4: Increased ensemble size for better stability
     
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     
     # Initialize and train model with early stopping and LR scheduling
-    # Team features: 21 features (removed 6 negative-importance features, added 4 derived + 6 new + 1 temporal)
+    # Team features: 20 features (removed 7 negative-importance features including TOV_sum, added 4 derived + 6 new + 1 temporal)
     n_team_features = X_team_train_scaled.shape[1]
     
     # Phase 3: Train ensemble of models
@@ -937,10 +936,10 @@ def cross_validate_model(base_path, n_folds=5, output_dir="Results"):
         # Train ensemble (simplified: 3 models for CV)
         n_team_features = X_team_train_scaled.shape[1]
         ensemble_models = []
-        dropout_rate = 0.2
+        dropout_rate = 0.1
         learning_rate = 0.0005
         batch_size = 8
-        weight_decay = 1e-4
+        weight_decay = 5e-4
         
         for ensemble_idx in range(3):  # 3 models for faster CV
             torch.manual_seed(42 + ensemble_idx)
