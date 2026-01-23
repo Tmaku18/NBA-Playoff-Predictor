@@ -21,8 +21,8 @@ TEAM_NAME_MAP = {
     'Dallas Mavericks': 'Dallas Mavericks'
 }
 
-# create new directory to store data
-output_dir = "Preprocessing\\Preprocessed Data\\Player Stats Regular and Playoff"
+# create new directory to store data (cross-platform compatible)
+output_dir = os.path.join("Preprocessing", "Preprocessed Data", "Player Stats Regular and Playoff")
 os.makedirs(output_dir, exist_ok=True)
 
 # manual list of 2024–25 playoff teams (must match TEAM_NAME_MAP mappings)

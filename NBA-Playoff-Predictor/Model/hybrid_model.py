@@ -214,7 +214,18 @@ class NBADataset(Dataset):
         }
 
 class HybridNBAModel(nn.Module):
-    def __init__(self, n_players, n_player_features=12, n_team_features=16):
+    def __init__(self, n_players, n_player_features=12, n_team_features=16, dropout_rate=0.3):
+        """
+        Hybrid NBA Model for historical evaluation.
+        Note: For the updated model with 20 features, attention mechanism, and ensemble training,
+        use hybrid_model_future_pred.py instead.
+        
+        Args:
+            n_players: Number of players per team
+            n_player_features: Number of features per player (default 12)
+            n_team_features: Number of team-level features (16 for this legacy model)
+            dropout_rate: Dropout probability (default 0.3)
+        """
         super().__init__()
         # player pathway (1D CNN)
         self.player_net = nn.Sequential(
@@ -227,14 +238,14 @@ class HybridNBAModel(nn.Module):
             nn.AdaptiveAvgPool1d(1),  # Reduces player dimension to 1
             nn.Flatten(),
             nn.Linear(64, 128),
-            nn.Dropout(0.3)
+            nn.Dropout(dropout_rate)
         )
         # team pathway (fully connected)
         self.team_net = nn.Sequential(
             nn.Linear(n_team_features, 128),
             nn.BatchNorm1d(128),
             nn.ReLU(),
-            nn.Dropout(0.3)
+            nn.Dropout(dropout_rate)
         )
         
         # combined network
