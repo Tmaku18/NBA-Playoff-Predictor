@@ -45,7 +45,7 @@ def calculate_ranking_accuracy(csv_path):
     overall_mae = np.mean(np.abs(np.array(overall_actual) - np.array(overall_predicted)))
     overall_perfect = np.sum(np.array(overall_actual) == np.array(overall_predicted))
     
-    #cConvert to dfs
+    # Convert to DataFrames
     season_results = pd.DataFrame(season_metrics)
     overall_results = pd.DataFrame({
         'Metric': ['Spearman_Correlation', 'Kendall_Tau', 'MAE', 'Perfect_Matches', 'Total_Teams'],

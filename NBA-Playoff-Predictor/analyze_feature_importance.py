@@ -126,11 +126,13 @@ def analyze_feature_importance():
     print(f"Using base_path: {base_path}")
     print(f"Using output_dir: {output_dir}")
     
-    # Team feature names (must match preprocessing order)
+    # Team feature names (must match preprocessing order in hybrid_model_future_pred.py)
+    # Updated: 20 features after removing noisy features and adding derived features
     team_feature_names = [
-        'MP_sum', 'FG%_wt', '3P%_wt', 'eFG%_wt', 'FT%_wt',
-        'TRB_sum', 'AST_sum', 'AST_top3', 'STL_sum', 'BLK_sum', 
-        'TOV_sum', 'PF_sum', 'PTS_sum', 'PTS_top3', 'G_mean', 'G_std'
+        'FT%_wt', 'TRB_sum', 'AST_sum', 'AST_top3', 'AST_top5',
+        'STL_sum', 'PTS_sum', 'PTS_top3', 'PTS_top5', 'G_mean', 'G_std',
+        'PTS_per_game', 'AST_TOV_ratio', 'TRB_per_min', 'MP_per_game',
+        'Defensive_activity', 'Defensive_per_game', 'PTS_std', 'AST_std', 'Years_since_2003'
     ]
     
     print("=" * 70)
@@ -195,7 +197,8 @@ def analyze_feature_importance():
     
     # Train model (quick training for importance analysis)
     print("\n3. Training model (75 epochs)...")
-    model = HybridNBAModel(n_players=X_player_train.shape[1])
+    n_team_features = X_team_train_scaled.shape[1]  # Should be 20 features
+    model = HybridNBAModel(n_players=X_player_train.shape[1], n_team_features=n_team_features)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
     criterion = nn.MSELoss()
     

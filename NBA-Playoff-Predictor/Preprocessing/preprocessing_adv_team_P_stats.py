@@ -1,8 +1,9 @@
 import pandas as pd
 import os
 
-# create new directory to store data
-output_dir = "Preprocessing\\Preprocessed Data\\Actual Playoff Team Stats"
+# create new directory to store data (cross-platform compatible)
+output_dir = os.path.join("Preprocessing", "Preprocessed Data", "Actual Playoff Team Stats")
+os.makedirs(output_dir, exist_ok=True)
 
 for year in range(2003, 2024): # modify this to change what files to filter
     season = f"{year}-{str(year+1)[-2:]}"  # formats as "2003-04", "2004-05", etc.

@@ -1,9 +1,14 @@
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+import os
+
+# Get the directory where this script is located (cross-platform compatible)
+script_dir = os.path.dirname(os.path.abspath(__file__))
 
 # Load your model output CSV
-df = pd.read_csv("Results/HYBRID_complete_rankings.csv")
+csv_path = os.path.join(script_dir, "Complete_Rankings.csv")
+df = pd.read_csv(csv_path)
 df['Season'] = df['Season'].astype(str)
 df['Actual_Rank'] = pd.to_numeric(df['Actual_Rank'])
 df['Predicted_Rank'] = pd.to_numeric(df['Predicted_Rank'])
